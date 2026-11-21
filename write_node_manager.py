@@ -148,6 +148,21 @@ $failedJob = $null
 $errorSummary = ''
 $jobLog = ''
 
+function Set-QueueState([string]$phase, [int]$currentIndex) {
+    # Replace checkpoints atomically, so the watchdog never reads half a file.
+    $state = @{ phase = $phase; completed = $completed; current_index = $currentIndex;
+                runner_pid = $PID; started_utc = $started.ToUniversalTime().ToString('o');
+                job_log = $jobLog }
+    $json = $state | ConvertTo-Json -Compress
+    $temporary = $queue.status_path + '.tmp'
+    [System.IO.File]::WriteAllText($temporary, $json, (New-Object System.Text.UTF8Encoding($false)))
+    if ([System.IO.File]::Exists($queue.status_path)) {
+        [System.IO.File]::Replace($temporary, $queue.status_path, $null)
+    } else {
+        [System.IO.File]::Move($temporary, $queue.status_path)
+    }
+}
+
 function Send-RenderNotification([string]$message) {
     if (!$settings -or !$settings.enabled -or !$settings.webhook_url) { return }
     $body = @{ content = $message; allowed_mentions = @{ parse = @() } } | ConvertTo-Json -Depth 4 -Compress
@@ -185,12 +200,14 @@ function Send-RenderReport([string]$report) {
     }
 }
 
+Set-QueueState 'running' -1
 Write-Host 'Rendering at full resolution. You may close Nuke; keep this console open.'
 Write-Host ('Logs: ' + $queue.log_directory)
 try {
     foreach ($job in $queue.jobs) {
         $failedJob = $job
         $jobLog = Join-Path $queue.log_directory ('job_{0:D3}.log' -f ($completed + 1))
+        Set-QueueState 'running' $completed
         Write-Host ('Rendering job {0} of {1}: {2} ({3}-{4})' -f ($completed + 1), @($queue.jobs).Count, $job.name, $job.first, $job.last)
         $renderArgs = @('--indie', '-f', '-X', [string]$job.name, '-F', ('{0}-{1}' -f $job.first, $job.last), [string]$queue.script_path)
         $LASTEXITCODE = 0
@@ -202,6 +219,7 @@ try {
         }
         $completed++
         $failedJob = $null
+        Set-QueueState 'running' -1
     }
 } catch {
     $errorSummary = 'Unable to run render: ' + $_.Exception.Message
@@ -235,11 +253,128 @@ if ($failedJob -or $errorSummary) {
     if ($tail.Length -gt 1100) { $tail = $tail.Substring($tail.Length - 1100) }
     $message = "Render FAILED: $scriptName`nCompleted: $completed / $(@($queue.jobs).Count)`nElapsed: $elapsed`n$errorSummary`n$shotReport`n`nERROR LOG (last lines):`n$tail"
     Write-Host 'Render failed. Remaining jobs were not started.'
-    Send-RenderReport $message
+    # Only the detached watchdog delivers notifications, preventing duplicates
+    # if this console exits while a normal report is being sent.
+    [System.IO.File]::WriteAllText($queue.report_path, $message, (New-Object System.Text.UTF8Encoding($false)))
+    Set-QueueState 'failed' $(if ($failedJob) { $completed } else { -1 })
+    Write-Host 'The background watchdog will send the Discord report.'
     exit 1
 }
 Write-Host 'All queued renders finished.'
-Send-RenderReport ("Render FINISHED: $scriptName`nCompleted: $completed / $(@($queue.jobs).Count)`nElapsed: $elapsed`n$shotReport")
+$message = "Render FINISHED: $scriptName`nCompleted: $completed / $(@($queue.jobs).Count)`nElapsed: $elapsed`n$shotReport"
+[System.IO.File]::WriteAllText($queue.report_path, $message, (New-Object System.Text.UTF8Encoding($false)))
+Set-QueueState 'finished' -1
+Write-Host 'The background watchdog will send the Discord report.'
+exit 0
+'''
+
+
+# Share the same no-mention delivery, retry, and message-splitting functions.
+DISCORD_WATCHDOG = r'''
+param([Parameter(Mandatory=$true)][string]$Manifest,
+      [Parameter(Mandatory=$true)][int]$ConsolePid)
+$ErrorActionPreference = 'Stop'
+$queue = Get-Content -LiteralPath $Manifest -Raw -Encoding UTF8 | ConvertFrom-Json
+$settings = $null
+try {
+    $settings = Get-Content -LiteralPath $queue.settings_path -Raw -Encoding UTF8 | ConvertFrom-Json
+} catch { }
+''' + DISCORD_QUEUE_RUNNER[
+    DISCORD_QUEUE_RUNNER.index('function Send-RenderNotification'):
+    DISCORD_QUEUE_RUNNER.index("Set-QueueState 'running' -1\nWrite-Host")
+] + r'''
+
+function Read-QueueState {
+    try { return (Get-Content -LiteralPath $queue.status_path -Raw -Encoding UTF8 | ConvertFrom-Json) }
+    catch { return $null }
+}
+
+function Open-MonitoredProcess([int]$processId) {
+    try {
+        $process = [System.Diagnostics.Process]::GetProcessById($processId)
+        $null = $process.Handle # Pin this process identity against PID reuse.
+        return $process
+    } catch { return $null }
+}
+
+function Has-ProcessExited($process) {
+    if ($null -eq $process) { return $true }
+    try { $process.Refresh(); return $process.HasExited }
+    catch { return $true }
+}
+
+$console = Open-MonitoredProcess $ConsolePid
+$runner = $null
+$state = $null
+$watchStarted = Get-Date
+$reason = ''
+while ($true) {
+    $latest = Read-QueueState
+    if ($null -ne $latest) { $state = $latest }
+    if ($state -and $state.phase -in @('finished', 'failed')) { break }
+    if (Has-ProcessExited $console) {
+        $reason = 'The render command window exited before recording a normal result.'
+        break
+    }
+    if ($state -and [int]$state.runner_pid -gt 0) {
+        if ($null -eq $runner) { $runner = Open-MonitoredProcess ([int]$state.runner_pid) }
+        if (Has-ProcessExited $runner) {
+            $reason = 'The render queue process exited unexpectedly.'
+            break
+        }
+    } elseif (((Get-Date) - $watchStarted).TotalSeconds -gt 60) {
+        $reason = 'The render queue did not start successfully within 60 seconds.'
+        break
+    }
+    Start-Sleep -Seconds 3
+}
+# Re-read after exit detection: a last checkpoint may have raced with the check.
+$latest = Read-QueueState
+if ($null -ne $latest) { $state = $latest }
+if ($state -and $state.phase -in @('finished', 'failed')) {
+    try {
+        $report = Get-Content -LiteralPath $queue.report_path -Raw -Encoding UTF8
+        Send-RenderReport $report
+        exit 0
+    } catch { $reason = 'The queue ended, but its saved report could not be read.' }
+}
+$completed = 0
+$currentIndex = -1
+if ($state) {
+    $completed = [int]$state.completed
+    $currentIndex = [int]$state.current_index
+}
+$scriptName = [System.IO.Path]::GetFileName($queue.script_path)
+$message = "Render STOPPED UNEXPECTEDLY: $scriptName`n$reason`n"
+$message += 'Completed (last saved checkpoint): ' + $completed + ' / ' + @($queue.jobs).Count + "`n"
+$message += "The last active shot is unconfirmed and may have a partial output.`n"
+$completedLines = @()
+$activeLines = @()
+$pendingLines = @()
+for ($index = 0; $index -lt @($queue.jobs).Count; $index++) {
+    $label = '- ' + (Get-JobLabel $queue.jobs[$index])
+    if ($index -lt $completed) { $completedLines += $label }
+    elseif ($index -eq $currentIndex) { $activeLines += $label }
+    else { $pendingLines += $label }
+}
+$message += "`nCOMPLETED - Nuke reported success:`n"
+if ($completedLines.Count) { $message += $completedLines -join "`n" } else { $message += '(none)' }
+$message += "`n`nLAST ACTIVE - completion unconfirmed; check before re-rendering:`n"
+if ($activeLines.Count) { $message += $activeLines -join "`n" } else { $message += '(none recorded)' }
+$message += "`n`nREMAINING - no saved completion; still need rendering:`n"
+if ($pendingLines.Count) { $message += $pendingLines -join "`n" } else { $message += '(none)' }
+if ($state -and $state.job_log -and (Test-Path -LiteralPath $state.job_log)) {
+    try {
+        $tail = (Get-Content -LiteralPath $state.job_log -Tail 14) -join "`n"
+        if ($tail.Length -gt 1100) { $tail = $tail.Substring($tail.Length - 1100) }
+        $message += "`n`nLAST LOG LINES:`n$tail"
+    } catch { }
+}
+try {
+    [System.IO.File]::WriteAllText((Join-Path $queue.log_directory 'interrupted_report.txt'), $message,
+                                 (New-Object System.Text.UTF8Encoding($false)))
+} catch { }
+Send-RenderReport $message
 exit 0
 '''
 
@@ -248,11 +383,18 @@ def write_discord_render_queue(queue_dir, executable, script_path, jobs, job_lab
     """Keep secrets out of generated queue files; runner reads local settings."""
     runner_path = os.path.join(queue_dir, "render_queue.ps1")
     manifest_path = os.path.join(queue_dir, "render_queue.json")
+    status_path = os.path.join(queue_dir, "queue_status.json")
     with open(runner_path, "w", encoding="utf-8-sig", newline="") as handle:
         handle.write(DISCORD_QUEUE_RUNNER)
+    with open(os.path.join(queue_dir, "render_watchdog.ps1"), "w", encoding="utf-8-sig") as handle:
+        handle.write(DISCORD_WATCHDOG)
+    with open(status_path, "w", encoding="utf-8") as handle:
+        json.dump({"phase": "pending", "completed": 0, "current_index": -1,
+                   "runner_pid": 0, "job_log": ""}, handle)
     with open(manifest_path, "w", encoding="utf-8") as handle:
         json.dump({"executable": executable, "script_path": script_path,
                    "settings_path": discord_settings_path(), "log_directory": queue_dir,
+                   "status_path": status_path, "report_path": os.path.join(queue_dir, "queue_report.txt"),
                    "jobs": [{"name": name, "first": first, "last": last,
                              "output_name": (job_labels or {}).get(name, name)}
                             for name, first, last in jobs]}, handle, ensure_ascii=False)
@@ -265,6 +407,20 @@ def write_discord_render_queue(queue_dir, executable, script_path, jobs, job_lab
                 batch_arg(powershell), "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
                 "-File", batch_arg(runner_path), "-Manifest", batch_arg(manifest_path)])
             + "\r\nendlocal\r\n")
+
+
+def start_render_watchdog(queue_dir, console_pid):
+    powershell = os.path.join(os.environ.get("SystemRoot", "C:/Windows"),
+                              "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    arguments = [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                 "-File", os.path.join(queue_dir, "render_watchdog.ps1"),
+                 "-Manifest", os.path.join(queue_dir, "render_queue.json"), "-ConsolePid", str(console_pid)]
+    # No shared console: closing the render CMD or Nuke cannot send the watcher
+    # their console-close event. Never kill any process from the watchdog.
+    with open(os.path.join(queue_dir, "watchdog.log"), "ab") as log:
+        return subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                                close_fds=True, cwd=queue_dir)
 
 
 def tcl_word(value):
@@ -470,7 +626,7 @@ def quit_rendering_instance():
 class WriteNodeManager(QtWidgets.QDialog):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Write Node Manager - Tcl v22")
+        self.setWindowTitle("Write Node Manager - Tcl v23")
         self.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint, True)
         self.setModal(False)
         self.resize(850, 440)
@@ -565,6 +721,7 @@ class WriteNodeManager(QtWidgets.QDialog):
         self.render_button.setMinimumWidth(90)
         self.execute_close_button.setMinimumWidth(175)
         self.render_process = None
+        self.watchdog_process = None
         self.table.itemChanged.connect(self.item_changed)
         self.table.cellClicked.connect(self.row_clicked)
         QtCore.QTimer.singleShot(0, self.refresh_nodes)
@@ -645,6 +802,13 @@ class WriteNodeManager(QtWidgets.QDialog):
             self.render_process = subprocess.Popen(
                 command, creationflags=subprocess.CREATE_NEW_CONSOLE,
                 cwd=os.path.dirname(script_path), close_fds=True)
+            if discord["enabled"]:
+                try:
+                    self.watchdog_process = start_render_watchdog(queue_dir, self.render_process.pid)
+                except Exception as error:
+                    raise RuntimeError("The render console has started, but its Discord watchdog could not launch. "
+                                       "The queue may still be rendering; do not launch it again. "
+                                       "Notifications are unavailable for this queue.\n" + str(error)) from error
         except Exception as error:
             QtWidgets.QMessageBox.warning(self, "Could not start render queue", str(error))
             return
@@ -798,7 +962,7 @@ class WriteNodeManager(QtWidgets.QDialog):
             details = traceback.format_exc()
             print(details)
             message = QtWidgets.QMessageBox(self)
-            message.setWindowTitle("Write list failed - Tcl v22")
+            message.setWindowTitle("Write list failed - Tcl v23")
             message.setIcon(QtWidgets.QMessageBox.Icon.Warning)
             message.setText("The Write list could not load.")
             message.setInformativeText(str(error))
