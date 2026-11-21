@@ -157,7 +157,9 @@ function Set-QueueState([string]$phase, [int]$currentIndex) {
     $temporary = $queue.status_path + '.tmp'
     [System.IO.File]::WriteAllText($temporary, $json, (New-Object System.Text.UTF8Encoding($false)))
     if ([System.IO.File]::Exists($queue.status_path)) {
-        [System.IO.File]::Replace($temporary, $queue.status_path, $null)
+        # PowerShell coerces bare $null to an empty string for .NET string
+        # parameters. File.Replace rejects that as an invalid backup path.
+        [System.IO.File]::Replace($temporary, $queue.status_path, [System.Management.Automation.Language.NullString]::Value)
     } else {
         [System.IO.File]::Move($temporary, $queue.status_path)
     }
@@ -626,7 +628,7 @@ def quit_rendering_instance():
 class WriteNodeManager(QtWidgets.QDialog):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Write Node Manager - Tcl v23")
+        self.setWindowTitle("Write Node Manager - Tcl v24")
         self.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint, True)
         self.setModal(False)
         self.resize(850, 440)
@@ -962,7 +964,7 @@ class WriteNodeManager(QtWidgets.QDialog):
             details = traceback.format_exc()
             print(details)
             message = QtWidgets.QMessageBox(self)
-            message.setWindowTitle("Write list failed - Tcl v23")
+            message.setWindowTitle("Write list failed - Tcl v24")
             message.setIcon(QtWidgets.QMessageBox.Icon.Warning)
             message.setText("The Write list could not load.")
             message.setInformativeText(str(error))
