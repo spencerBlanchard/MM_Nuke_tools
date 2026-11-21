@@ -4,7 +4,267 @@ import os
 import sys
 import tempfile
 import subprocess
-from PySide6 import QtCore, QtGui, QtWidgets
+import json
+import re
+from PySide6 import QtCore, QtGui, QtWidgets, QtNetwork
+
+
+def discord_settings_path():
+    # One user-level settings file shared by every script and Nuke instance.
+    return os.path.join(os.path.expanduser("~"), ".nuke", "nuke_render_panel_discord.json")
+
+
+def validate_webhook_url(value):
+    value = value.strip()
+    if not re.fullmatch(r"https://(?:discord\.com|discordapp\.com)/api/(?:v\d+/)?webhooks/\d+/[A-Za-z0-9_.-]+", value):
+        raise ValueError("Paste the complete Discord webhook URL copied from your channel.")
+    return value
+
+
+def load_discord_settings():
+    try:
+        with open(discord_settings_path(), encoding="utf-8") as handle:
+            settings = json.load(handle)
+        return {"enabled": bool(settings.get("enabled", False)),
+                "webhook_url": str(settings.get("webhook_url", ""))}
+    except FileNotFoundError:
+        return {"enabled": False, "webhook_url": ""}
+
+
+def save_discord_settings(settings):
+    path = discord_settings_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False,
+                                         dir=os.path.dirname(path)) as handle:
+            temporary = handle.name
+            json.dump(settings, handle, indent=2)
+        os.replace(temporary, path)
+    finally:
+        if temporary and os.path.isfile(temporary):
+            os.remove(temporary)
+
+
+class DiscordSettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Discord notifications")
+        self.resize(550, 200)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.enabled = QtWidgets.QCheckBox("Notify when the render queue finishes or fails")
+        layout.addWidget(self.enabled)
+        layout.addWidget(QtWidgets.QLabel("Webhook URL"))
+        self.url = QtWidgets.QLineEdit()
+        self.url.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.url.setPlaceholderText("Paste your Discord webhook URL here")
+        layout.addWidget(self.url)
+        show_url = QtWidgets.QCheckBox("Show URL")
+        show_url.toggled.connect(lambda shown: self.url.setEchoMode(
+            QtWidgets.QLineEdit.EchoMode.Normal if shown else QtWidgets.QLineEdit.EchoMode.Password))
+        layout.addWidget(show_url)
+        note = QtWidgets.QLabel("Click Save to apply these settings to all projects on this computer.\n"
+                                "The URL is stored in a local settings file. No @mentions are sent.\n"
+                                "Failure notifications include the last lines of the render log.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.test_status = QtWidgets.QLabel()
+        self.test_status.setWordWrap(True)
+        layout.addWidget(self.test_status)
+        buttons = QtWidgets.QHBoxLayout()
+        self.test_button = QtWidgets.QPushButton("Send test")
+        self.test_button.setAutoDefault(False)
+        self.test_button.clicked.connect(self.send_test)
+        buttons.addWidget(self.test_button)
+        buttons.addStretch()
+        save = QtWidgets.QPushButton("Save")
+        save.clicked.connect(self.save_settings)
+        cancel = QtWidgets.QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(save)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        self.network = QtNetwork.QNetworkAccessManager(self)
+        try:
+            settings = load_discord_settings()
+        except (ValueError, OSError, TypeError, AttributeError):
+            settings = {"enabled": False, "webhook_url": ""}
+            self.test_status.setText("Saved settings could not be read. Enter and save the URL again.")
+        self.enabled.setChecked(settings["enabled"])
+        self.url.setText(settings["webhook_url"])
+
+    def save_settings(self):
+        try:
+            url = self.url.text().strip()
+            if url or self.enabled.isChecked():
+                url = validate_webhook_url(url)
+            save_discord_settings({"enabled": self.enabled.isChecked(), "webhook_url": url})
+        except (ValueError, OSError) as error:
+            QtWidgets.QMessageBox.warning(self, "Could not save Discord settings", str(error))
+            return
+        self.accept()
+
+    def send_test(self):
+        try:
+            url = validate_webhook_url(self.url.text())
+        except ValueError as error:
+            self.test_status.setText(str(error))
+            return
+        request = QtNetwork.QNetworkRequest(QtCore.QUrl(url + "?wait=true"))
+        request.setHeader(QtNetwork.QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
+        request.setTransferTimeout(15000)
+        payload = json.dumps({"content": "Nuke Render Panel: Discord notifications are working.",
+                              "allowed_mentions": {"parse": []}}).encode("utf-8")
+        self.test_button.setEnabled(False)
+        self.test_status.setText("Sending test...")
+        reply = self.network.post(request, QtCore.QByteArray(payload))
+
+        def finished():
+            status = reply.attribute(QtNetwork.QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+            if reply.error() == QtNetwork.QNetworkReply.NetworkError.NoError and status and 200 <= int(status) < 300:
+                self.test_status.setText("Test delivered. Enable notifications and click Save.")
+            else:
+                self.test_status.setText("Test failed" + (f" (HTTP {status})" if status else "")
+                                         + ". Check the URL and internet connection.")
+            self.test_button.setEnabled(True)
+            reply.deleteLater()
+
+        reply.finished.connect(finished)
+
+
+# Runs in the independent Windows console, without importing Nuke or Python.
+DISCORD_QUEUE_RUNNER = r'''
+param([Parameter(Mandatory=$true)][string]$Manifest)
+$ErrorActionPreference = 'Continue'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding
+$queue = Get-Content -LiteralPath $Manifest -Raw -Encoding UTF8 | ConvertFrom-Json
+$settings = $null
+try {
+    $settings = Get-Content -LiteralPath $queue.settings_path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+} catch { Write-Host 'Warning: Discord settings could not be read. Rendering will continue.' }
+$started = Get-Date
+$completed = 0
+$failedJob = $null
+$errorSummary = ''
+$jobLog = ''
+
+function Send-RenderNotification([string]$message) {
+    if (!$settings -or !$settings.enabled -or !$settings.webhook_url) { return }
+    $body = @{ content = $message; allowed_mentions = @{ parse = @() } } | ConvertTo-Json -Depth 4 -Compress
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        try {
+            Invoke-RestMethod -Uri ($settings.webhook_url + '?wait=true') -Method Post -ContentType 'application/json' -Body $bytes -TimeoutSec 15 -ErrorAction Stop | Out-Null
+            Write-Host 'Discord notification delivered.'
+            return
+        } catch {
+            # Never print the exception: it can contain the private webhook URL.
+            if ($attempt -lt 2) { Start-Sleep -Seconds 2 }
+        }
+    }
+    Write-Host 'Warning: Discord notification could not be delivered. Render results are unchanged.'
+}
+
+function Get-JobLabel($job) {
+    $label = [string]$job.output_name
+    if ([string]::IsNullOrWhiteSpace($label)) { $label = [string]$job.name }
+    return ('{0} [Write: {1}; frames {2}-{3}]' -f $label, $job.name, $job.first, $job.last)
+}
+
+function Send-RenderReport([string]$report) {
+    # Keep every shot in the report, even when it needs several Discord messages.
+    while ($report.Length -gt 0) {
+        $length = [Math]::Min(1800, $report.Length)
+        if ($report.Length -gt $length) {
+            $newline = $report.LastIndexOf("`n", $length - 1, $length)
+            if ($newline -gt 0) { $length = $newline + 1 }
+        }
+        Send-RenderNotification ($report.Substring(0, $length))
+        $report = $report.Substring($length)
+    }
+}
+
+Write-Host 'Rendering at full resolution. You may close Nuke; keep this console open.'
+Write-Host ('Logs: ' + $queue.log_directory)
+try {
+    foreach ($job in $queue.jobs) {
+        $failedJob = $job
+        $jobLog = Join-Path $queue.log_directory ('job_{0:D3}.log' -f ($completed + 1))
+        Write-Host ('Rendering job {0} of {1}: {2} ({3}-{4})' -f ($completed + 1), @($queue.jobs).Count, $job.name, $job.first, $job.last)
+        $renderArgs = @('--indie', '-f', '-X', [string]$job.name, '-F', ('{0}-{1}' -f $job.first, $job.last), [string]$queue.script_path)
+        $LASTEXITCODE = 0
+        & $queue.executable @renderArgs 2>&1 | Tee-Object -FilePath $jobLog
+        $renderExitCode = $LASTEXITCODE
+        if ($renderExitCode -ne 0) {
+            $errorSummary = 'Nuke exit code: ' + $renderExitCode
+            break
+        }
+        $completed++
+        $failedJob = $null
+    }
+} catch {
+    $errorSummary = 'Unable to run render: ' + $_.Exception.Message
+}
+$elapsed = ((Get-Date) - $started).ToString('hh\:mm\:ss')
+$scriptName = [System.IO.Path]::GetFileName($queue.script_path)
+$completedLines = @()
+$failedLines = @()
+$notStartedLines = @()
+for ($index = 0; $index -lt @($queue.jobs).Count; $index++) {
+    $label = '- ' + (Get-JobLabel $queue.jobs[$index])
+    if ($index -lt $completed) {
+        $completedLines += $label
+    } elseif ($failedJob -and $index -eq $completed) {
+        $failedLines += $label
+    } else {
+        $notStartedLines += $label
+    }
+}
+$shotReport = "`nCOMPLETED ($($completedLines.Count)) - Nuke reported success:`n"
+if ($completedLines.Count) { $shotReport += $completedLines -join "`n" } else { $shotReport += '(none)' }
+$shotReport += "`n`nFAILED ($($failedLines.Count)) - render again after fixing the error:`n"
+if ($failedLines.Count) { $shotReport += $failedLines -join "`n" } else { $shotReport += '(none)' }
+$shotReport += "`n`nNOT STARTED ($($notStartedLines.Count)) - still need rendering:`n"
+if ($notStartedLines.Count) { $shotReport += $notStartedLines -join "`n" } else { $shotReport += '(none)' }
+if ($failedJob -or $errorSummary) {
+    $tail = ''
+    if ($jobLog -and (Test-Path -LiteralPath $jobLog)) {
+        $tail = (Get-Content -LiteralPath $jobLog -Tail 14) -join "`n"
+    }
+    if ($tail.Length -gt 1100) { $tail = $tail.Substring($tail.Length - 1100) }
+    $message = "Render FAILED: $scriptName`nCompleted: $completed / $(@($queue.jobs).Count)`nElapsed: $elapsed`n$errorSummary`n$shotReport`n`nERROR LOG (last lines):`n$tail"
+    Write-Host 'Render failed. Remaining jobs were not started.'
+    Send-RenderReport $message
+    exit 1
+}
+Write-Host 'All queued renders finished.'
+Send-RenderReport ("Render FINISHED: $scriptName`nCompleted: $completed / $(@($queue.jobs).Count)`nElapsed: $elapsed`n$shotReport")
+exit 0
+'''
+
+
+def write_discord_render_queue(queue_dir, executable, script_path, jobs, job_labels=None):
+    """Keep secrets out of generated queue files; runner reads local settings."""
+    runner_path = os.path.join(queue_dir, "render_queue.ps1")
+    manifest_path = os.path.join(queue_dir, "render_queue.json")
+    with open(runner_path, "w", encoding="utf-8-sig", newline="") as handle:
+        handle.write(DISCORD_QUEUE_RUNNER)
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump({"executable": executable, "script_path": script_path,
+                   "settings_path": discord_settings_path(), "log_directory": queue_dir,
+                   "jobs": [{"name": name, "first": first, "last": last,
+                             "output_name": (job_labels or {}).get(name, name)}
+                            for name, first, last in jobs]}, handle, ensure_ascii=False)
+    powershell = os.path.join(os.environ.get("SystemRoot", "C:/Windows"),
+                              "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    if not os.path.isfile(powershell):
+        raise RuntimeError("Windows PowerShell was not found. Turn off Discord notifications to use the standard render queue.")
+    return ("@echo off\r\nsetlocal DisableDelayedExpansion\r\nchcp 65001 >nul\r\n"
+            "title Nuke Indie Render Queue\r\n" + " ".join([
+                batch_arg(powershell), "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", batch_arg(runner_path), "-Manifest", batch_arg(manifest_path)])
+            + "\r\nendlocal\r\n")
 
 
 def tcl_word(value):
@@ -210,7 +470,7 @@ def quit_rendering_instance():
 class WriteNodeManager(QtWidgets.QDialog):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Write Node Manager - Tcl v19")
+        self.setWindowTitle("Write Node Manager - Tcl v22")
         self.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint, True)
         self.setModal(False)
         self.resize(850, 440)
@@ -276,6 +536,21 @@ class WriteNodeManager(QtWidgets.QDialog):
         self.scan_warnings.hide()
         layout.addWidget(self.scan_warnings)
         execute_row = QtWidgets.QHBoxLayout()
+        discord_button = QtWidgets.QPushButton("Discord")
+        discord_button.setAutoDefault(False)
+        discord_button.clicked.connect(self.open_discord_settings)
+        execute_row.addWidget(discord_button)
+        self.notification_status = QtWidgets.QLabel()
+        notification_font = self.notification_status.font()
+        notification_font.setPointSize(9)
+        self.notification_status.setFont(notification_font)
+        execute_row.addWidget(self.notification_status)
+        self.update_notification_status()
+        # Pick up settings saved from another script or Nuke window, too.
+        self.notification_timer = QtCore.QTimer(self)
+        self.notification_timer.setInterval(2000)
+        self.notification_timer.timeout.connect(self.update_notification_status)
+        self.notification_timer.start()
         execute_row.addStretch()
         self.render_button = QtWidgets.QPushButton("Render")
         self.execute_close_button = QtWidgets.QPushButton("Render && close Nuke")
@@ -294,6 +569,22 @@ class WriteNodeManager(QtWidgets.QDialog):
         self.table.cellClicked.connect(self.row_clicked)
         QtCore.QTimer.singleShot(0, self.refresh_nodes)
 
+    def open_discord_settings(self):
+        DiscordSettingsDialog(self).exec()
+        self.update_notification_status()
+
+    def update_notification_status(self):
+        try:
+            settings = load_discord_settings()
+            enabled = settings["enabled"]
+            tooltip = "Shared across all projects on this computer. Change settings with Discord."
+        except (ValueError, OSError, TypeError, AttributeError):
+            enabled = False
+            tooltip = "Discord settings could not be read. Open Discord and save them again."
+        self.notification_status.setText("Notifications ON" if enabled else "Notifications OFF")
+        self.notification_status.setStyleSheet("color: #74c58a;" if enabled else "color: #e47d7d;")
+        self.notification_status.setToolTip(tooltip)
+
     def render_enabled(self, close_nuke=False):
         try:
             if os.name != "nt":
@@ -304,6 +595,7 @@ class WriteNodeManager(QtWidgets.QDialog):
             self.render_button.setFocus()
             QtWidgets.QApplication.processEvents()
             jobs = []
+            job_labels = {}
             for row in range(self.table.rowCount()):
                 node = self.table.item(row, 0).data(QtCore.Qt.ItemDataRole.UserRole)
                 if bool(node["disable"].value()):
@@ -314,6 +606,7 @@ class WriteNodeManager(QtWidgets.QDialog):
                 if first > last:
                     raise ValueError(f"{node.fullName()}: In must not exceed Out.")
                 jobs.append((node.fullName(), first, last))
+                job_labels[node.fullName()] = self.table.item(row, 1).text()
             if not jobs:
                 raise RuntimeError("No enabled Write nodes are listed.")
             if getattr(self, "scan_incomplete", True):
@@ -328,6 +621,12 @@ class WriteNodeManager(QtWidgets.QDialog):
                 if not executable:
                     return
             batch = build_render_batch(executable, script_path, jobs)
+            try:
+                discord = load_discord_settings()
+            except (ValueError, OSError, TypeError, AttributeError):
+                raise RuntimeError("Discord settings could not be read. Open Discord settings and save them again.")
+            if discord["enabled"]:
+                validate_webhook_url(discord["webhook_url"])
             # Save current checkbox/range edits before the independent process loads them.
             saved = nuke.scriptSave()
             if saved is False:
@@ -335,6 +634,8 @@ class WriteNodeManager(QtWidgets.QDialog):
             if not os.path.isfile(script_path):
                 raise RuntimeError("The saved Nuke script could not be found.")
             queue_dir = tempfile.mkdtemp(prefix="nuke_render_queue_")
+            if discord["enabled"]:
+                batch = write_discord_render_queue(queue_dir, executable, script_path, jobs, job_labels)
             batch_path = os.path.join(queue_dir, "render_queue.cmd")
             with open(batch_path, "w", encoding="utf-8", newline="") as handle:
                 handle.write(batch)
@@ -497,7 +798,7 @@ class WriteNodeManager(QtWidgets.QDialog):
             details = traceback.format_exc()
             print(details)
             message = QtWidgets.QMessageBox(self)
-            message.setWindowTitle("Write list failed - Tcl v19")
+            message.setWindowTitle("Write list failed - Tcl v22")
             message.setIcon(QtWidgets.QMessageBox.Icon.Warning)
             message.setText("The Write list could not load.")
             message.setInformativeText(str(error))
